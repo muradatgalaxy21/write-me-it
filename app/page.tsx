@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Redline } from "@/components/Redline";
 import { Markdown } from "@/components/Markdown";
 
@@ -14,19 +14,23 @@ const STAGE_VERB: Record<Stage, string> = {
   writing: "✍️  Writer is drafting…",
   critiquing: "🔴  Critic is reviewing…",
   editing: "✅  Editor is polishing…",
-  done: "Done — pick your winner",
+  done: "Done",
 };
 
+// single-track pipe: one draft, one critique, one edited result.
+// `refined` flips true once the single allowed refine pass is spent.
 type Pipe = {
-  drafts: string[];
-  critiques: Critique[];
-  edited: string[];
-  winner: number | null;
+  draft: string;
+  critique: Critique | null;
+  edited: string;
+  refined: boolean;
 };
 
-const emptyPipe: Pipe = { drafts: [], critiques: [], edited: [], winner: null };
+const emptyPipe: Pipe = { draft: "", critique: null, edited: "", refined: false };
 
-async function post<T>(url: string, body: unknown): Promise<T> {
+type Usage = { usage?: { total_tokens?: number }; total_tokens_all_time?: number };
+
+async function post<T>(url: string, body: unknown): Promise<T & Usage> {
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -34,7 +38,7 @@ async function post<T>(url: string, body: unknown): Promise<T> {
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data.detail ?? data.error ?? "request failed");
-  return data as T;
+  return data as T & Usage;
 }
 
 export default function Home() {
@@ -46,33 +50,62 @@ export default function Home() {
   const [outline, setOutline] = useState<Pipe>(emptyPipe);
   const [blog, setBlog] = useState<Pipe>(emptyPipe);
 
+  // token counters — articleTokens = this run (outline + blog), total = all-time backend
+  const [articleTokens, setArticleTokens] = useState(0);
+  const [totalTokens, setTotalTokens] = useState(0);
+
+  const continueRef = useRef<HTMLDivElement>(null);
+
   const busy = stage === "writing" || stage === "critiquing" || stage === "editing";
 
-  // run writer → critic → editor for one phase; setter stores the growing pipe
-  async function pipeline(
-    writerBody: unknown,
-    set: (p: Pipe) => void
-  ): Promise<Pipe> {
-    setStage("writing");
-    const w = await post<{ drafts: string[] }>("/api/writer", writerBody);
-    let p: Pipe = { ...emptyPipe, drafts: w.drafts };
-    set(p);
+  function applyUsage(d: Usage) {
+    if (d?.usage?.total_tokens) setArticleTokens((t) => t + d.usage!.total_tokens!);
+    if (typeof d?.total_tokens_all_time === "number") setTotalTokens(d.total_tokens_all_time);
+  }
 
+  // critic → editor on a single draft. Shared by first pass and refine pass.
+  async function reviewAndEdit(mode: Phase, draft: string): Promise<{ critique: Critique; edited: string }> {
     setStage("critiquing");
-    const c = await post<{ critiques: Critique[] }>("/api/critic", { drafts: w.drafts });
-    p = { ...p, critiques: c.critiques };
-    set(p);
+    const c = await post<{ critiques: Critique[] }>("/api/critic", { drafts: [draft], mode });
+    applyUsage(c);
+    const critique = c.critiques[0] ?? { annotated: "", issues: [] };
 
     setStage("editing");
     const e = await post<{ edited: string[] }>("/api/editor", {
-      drafts: w.drafts,
-      critiques: c.critiques,
+      drafts: [draft],
+      critiques: [critique],
+      mode,
     });
-    p = { ...p, edited: e.edited };
-    set(p);
+    applyUsage(e);
+    return { critique, edited: e.edited[0] ?? draft };
+  }
 
+  // writer → critic → editor for one phase
+  async function pipeline(mode: Phase, writerBody: unknown, set: (p: Pipe) => void) {
+    setStage("writing");
+    const w = await post<{ drafts: string[] }>("/api/writer", writerBody);
+    applyUsage(w);
+    const draft = w.drafts[0] ?? "";
+    set({ ...emptyPipe, draft });
+
+    const { critique, edited } = await reviewAndEdit(mode, draft);
+    set({ draft, critique, edited, refined: false });
     setStage("done");
-    return p;
+  }
+
+  // one allowed refine pass: re-critique the edited text, edit again
+  async function refine(mode: Phase, pipe: Pipe, set: (p: Pipe) => void) {
+    if (pipe.refined || busy || !pipe.edited) return;
+    setError("");
+    setPhase(mode);
+    try {
+      const { critique, edited } = await reviewAndEdit(mode, pipe.edited);
+      set({ draft: pipe.draft, critique, edited, refined: true });
+      setStage("done");
+    } catch (err: any) {
+      setError(err.message ?? "Something broke");
+      setStage("idle");
+    }
   }
 
   async function runOutline() {
@@ -81,8 +114,9 @@ export default function Home() {
     setPhase("outline");
     setOutline(emptyPipe);
     setBlog(emptyPipe);
+    setArticleTokens(0); // new article — reset its counter
     try {
-      await pipeline({ topic, mode: "outline" }, setOutline);
+      await pipeline("outline", { topic, mode: "outline" }, setOutline);
     } catch (err: any) {
       setError(err.message ?? "Something broke");
       setStage("idle");
@@ -90,13 +124,12 @@ export default function Home() {
   }
 
   async function runBlog() {
-    if (outline.winner === null || busy) return;
-    const chosen = outline.edited[outline.winner];
+    if (!outline.edited || busy) return;
     setError("");
     setPhase("blog");
     setBlog(emptyPipe);
     try {
-      await pipeline({ topic, mode: "blog", outline: chosen }, setBlog);
+      await pipeline("blog", { topic, mode: "blog", outline: outline.edited }, setBlog);
     } catch (err: any) {
       setError(err.message ?? "Something broke");
       setStage("idle");
@@ -104,18 +137,37 @@ export default function Home() {
   }
 
   const outlineReady = outline.edited.length > 0;
-  const showContinue =
-    phase === "outline" && stage === "done" && outline.winner !== null;
+  // can move to blog once the outline is done and we're not mid-run
+  const showContinue = phase === "outline" && stage === "done" && outlineReady;
+
+  // after the outline is ready, scroll the "continue" button into view
+  useEffect(() => {
+    if (showContinue) {
+      continueRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [showContinue]);
+
+  // progress line: shown at top during the outline phase, but moved to the bottom
+  // (below the outline, above the blog) during the blog phase
+  const progress = (busy || stage === "done") && (
+    <div className="mt-4 font-mono text-sm text-neutral-600">
+      <span className={busy ? "animate-pulse" : ""}>
+        {phase === "outline" ? "Outline · " : "Blog · "}
+        {STAGE_VERB[stage]}
+      </span>
+    </div>
+  );
 
   return (
-    <main className="mx-auto max-w-6xl px-4 py-10">
+    <main className="mx-auto max-w-3xl px-4 py-10">
       <header className="mb-8">
         <h1 className="text-3xl font-bold tracking-tight">
           write<span className="text-accent">·</span>me<span className="text-accent">·</span>it
         </h1>
         <p className="mt-1 text-neutral-500">
-          Outline first (2 → critic → editor → pick), then full blog (2 → critic → editor → pick).
+          Turn a topic into a polished blog post through a writer → critic → editor pipeline.
         </p>
+        <TokenBar article={articleTokens} total={totalTokens} />
       </header>
 
       <div className="flex flex-col gap-3 sm:flex-row">
@@ -131,18 +183,12 @@ export default function Home() {
           disabled={busy}
           className="rounded-lg bg-accent px-6 py-3 text-sm font-semibold text-white transition hover:opacity-90 disabled:opacity-50"
         >
-          {busy ? "Working…" : "Generate outlines"}
+          {busy ? "Working…" : "Generate outline"}
         </button>
       </div>
 
-      {(busy || stage === "done") && (
-        <div className="mt-4 font-mono text-sm text-neutral-600">
-          <span className={busy ? "animate-pulse" : ""}>
-            {phase === "outline" ? "Outline · " : "Blog · "}
-            {STAGE_VERB[stage]}
-          </span>
-        </div>
-      )}
+      {/* outline-phase progress stays at the top (good signal for the outline) */}
+      {phase === "outline" && progress}
       {error && (
         <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
           {error}
@@ -152,30 +198,57 @@ export default function Home() {
       {/* ---- Outline phase ---- */}
       {outlineReady && (
         <>
-          <PhaseHeading n={1} label="Outlines — pick one to build" />
-          <Grid pipe={outline} label="Outline" setWinner={(i) => setOutline({ ...outline, winner: i })} />
+          <PhaseHeading n={1} label="Outline — review it" />
+          <ResultCard
+            label="Outline"
+            pipe={outline}
+            busy={busy}
+            onRefine={() => refine("outline", outline, setOutline)}
+          />
         </>
       )}
 
       {showContinue && (
-        <div className="mt-6 flex justify-center">
+        <div ref={continueRef} className="mt-6 flex justify-center">
           <button
             onClick={runBlog}
             className="rounded-lg bg-accent px-8 py-3 text-sm font-semibold text-white transition hover:opacity-90"
           >
-            Continue → write 2 blogs from this outline
+            Continue → write the blog from this outline
           </button>
         </div>
       )}
 
+      {/* blog-phase progress moves to the bottom: below the outline, above the blog */}
+      {phase === "blog" && progress}
+
       {/* ---- Blog phase ---- */}
-      {blog.drafts.length > 0 && (
+      {blog.edited.length > 0 && (
         <>
-          <PhaseHeading n={2} label="Blogs — pick your winner" />
-          <Grid pipe={blog} label="Draft" setWinner={(i) => setBlog({ ...blog, winner: i })} />
+          <PhaseHeading n={2} label="Blog — your draft" />
+          <ResultCard
+            label="Blog"
+            pipe={blog}
+            busy={busy}
+            onRefine={() => refine("blog", blog, setBlog)}
+            showExport
+          />
         </>
       )}
     </main>
+  );
+}
+
+function TokenBar({ article, total }: { article: number; total: number }) {
+  return (
+    <div className="mt-4 flex flex-wrap gap-3 font-mono text-xs">
+      <span className="rounded-md bg-accent/10 px-3 py-1.5 text-accent">
+        This article: {article.toLocaleString()} tokens
+      </span>
+      <span className="rounded-md bg-neutral-100 px-3 py-1.5 text-neutral-600">
+        Total (all articles): {total.toLocaleString()} tokens
+      </span>
+    </div>
   );
 }
 
@@ -190,94 +263,51 @@ function PhaseHeading({ n, label }: { n: number; label: string }) {
   );
 }
 
-function Grid({
+function ResultCard({
+  label,
   pipe,
-  label,
-  setWinner,
+  busy,
+  onRefine,
+  showExport,
 }: {
+  label: string;
   pipe: Pipe;
-  label: string;
-  setWinner: (i: number | null) => void;
-}) {
-  return (
-    <section className="grid grid-cols-1 gap-5 md:grid-cols-2">
-      {pipe.drafts.map((draft, i) => (
-        <Card
-          key={i}
-          index={i}
-          label={label}
-          draft={draft}
-          critique={pipe.critiques[i]}
-          edited={pipe.edited[i]}
-          isWinner={pipe.winner === i}
-          dimmed={pipe.winner !== null && pipe.winner !== i}
-          onPick={() => setWinner(pipe.winner === i ? null : i)}
-        />
-      ))}
-    </section>
-  );
-}
-
-function Card({
-  index,
-  label,
-  draft,
-  critique,
-  edited,
-  isWinner,
-  dimmed,
-  onPick,
-}: {
-  index: number;
-  label: string;
-  draft: string;
-  critique?: Critique;
-  edited?: string;
-  isWinner: boolean;
-  dimmed: boolean;
-  onPick: () => void;
+  busy: boolean;
+  onRefine: () => void;
+  showExport?: boolean;
 }) {
   const [copied, setCopied] = useState(false);
+  const finalRef = useRef<HTMLDivElement>(null);
 
   async function copy() {
-    if (!edited) return;
-    await navigator.clipboard.writeText(edited);
+    if (!pipe.edited) return;
+    await navigator.clipboard.writeText(pipe.edited);
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
   }
 
+  async function downloadPdf() {
+    if (!finalRef.current) return;
+    const html2pdf = (await import("html2pdf.js")).default;
+    await html2pdf()
+      .set({
+        margin: 12,
+        filename: `${label.toLowerCase()}.pdf`,
+        html2canvas: { scale: 2 },
+        jsPDF: { unit: "mm", format: "a4", orientation: "portrait" },
+      })
+      .from(finalRef.current)
+      .save();
+  }
+
   return (
-    <article
-      className={`flex flex-col rounded-2xl border bg-white p-4 shadow-sm transition ${
-        isWinner ? "border-accent ring-2 ring-accent/30 md:col-span-2" : "border-neutral-200"
-      } ${dimmed ? "opacity-40" : ""}`}
-    >
-      <div className="mb-3 flex items-center justify-between">
-        <span className="font-mono text-xs uppercase tracking-wider text-neutral-400">
-          {label} {index + 1}
-        </span>
-        <button
-          onClick={onPick}
-          className={`rounded-full border px-3 py-1 text-xs font-medium transition ${
-            isWinner
-              ? "border-accent bg-accent text-white"
-              : "border-neutral-300 text-neutral-600 hover:border-accent hover:text-accent"
-          }`}
-        >
-          {isWinner ? "★ Selected" : "Select"}
-        </button>
-      </div>
-
-      <Section title={label} defaultOpen>
-        <Markdown text={draft} />
-      </Section>
-
-      {critique && (
-        <Section title="🔴 Critique" defaultOpen={!isWinner}>
-          <Redline text={critique.annotated || draft} />
-          {critique.issues.length > 0 && (
+    <article className="flex flex-col rounded-2xl border border-neutral-200 bg-white p-4 shadow-sm">
+      {pipe.critique && (
+        <Section title="🔴 Critique" defaultOpen={false}>
+          <Redline text={pipe.critique.annotated || pipe.draft} />
+          {pipe.critique.issues.length > 0 && (
             <ul className="mt-2 list-disc space-y-1 pl-5 font-mono text-xs text-red-600">
-              {critique.issues.map((iss, k) => (
+              {pipe.critique.issues.map((iss, k) => (
                 <li key={k}>{iss}</li>
               ))}
             </ul>
@@ -285,17 +315,42 @@ function Card({
         </Section>
       )}
 
-      {edited && (
+      {pipe.edited && (
         <Section title="✅ Final" defaultOpen>
-          <Markdown text={edited} />
-          <button
-            onClick={copy}
-            className="mt-3 rounded-md border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 hover:border-accent hover:text-accent"
-          >
-            {copied ? "Copied ✓" : "Copy final"}
-          </button>
+          <div ref={finalRef}>
+            <Markdown text={pipe.edited} />
+          </div>
         </Section>
       )}
+
+      {/* actions: refine (once) + export */}
+      <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-neutral-100 pt-3">
+        <button
+          onClick={onRefine}
+          disabled={busy || pipe.refined}
+          title={pipe.refined ? "Refine limit reached (1 per phase)" : ""}
+          className="rounded-lg border border-neutral-300 px-4 py-2 text-sm font-semibold text-neutral-600 transition hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {pipe.refined ? "✓ Refined (limit reached)" : "↻ Refine more"}
+        </button>
+
+        {showExport && (
+          <>
+            <button
+              onClick={copy}
+              className="rounded-md border border-neutral-300 px-3 py-2 text-xs font-medium text-neutral-600 hover:border-accent hover:text-accent"
+            >
+              {copied ? "Copied ✓" : "Copy final"}
+            </button>
+            <button
+              onClick={downloadPdf}
+              className="rounded-md border border-neutral-300 px-3 py-2 text-xs font-medium text-neutral-600 hover:border-accent hover:text-accent"
+            >
+              ⬇ Download PDF
+            </button>
+          </>
+        )}
+      </div>
     </article>
   );
 }
