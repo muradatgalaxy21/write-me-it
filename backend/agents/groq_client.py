@@ -8,7 +8,7 @@ from groq import Groq
 MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 # Output cap for one call. One call returns all 3 drafts in JSON, so this is a
 # whole-response budget (~200 tokens/draft + JSON overhead, headroom for critic).
-MAX_TOKENS = int(os.environ.get("GROQ_MAX_TOKENS", "2048"))
+MAX_TOKENS = int(os.environ.get("GROQ_MAX_TOKENS", "4096"))
 
 
 @lru_cache(maxsize=1)
