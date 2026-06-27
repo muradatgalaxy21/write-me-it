@@ -302,6 +302,12 @@ function ResultCard({
 
   return (
     <article className="flex flex-col rounded-2xl border border-neutral-200 bg-white p-4 shadow-sm">
+      {pipe.draft && (
+        <Section title="✍️ First draft" defaultOpen={false}>
+          <Markdown text={pipe.draft} />
+        </Section>
+      )}
+
       {pipe.critique && (
         <Section title="🔴 Critique" defaultOpen={false}>
           <Redline text={pipe.critique.annotated || pipe.draft} />

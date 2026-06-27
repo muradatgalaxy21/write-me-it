@@ -163,7 +163,9 @@ def editor(req: EditorReq):
     system = EDITOR_BLOG_SYSTEM if req.mode == "blog" else EDITOR_OUTLINE_SYSTEM
     budget = BUDGET["editor_blog"] if req.mode == "blog" else BUDGET["editor_outline"]
     try:
-        data, usage = chat_json(system, editor_user(req.drafts, critiques), max_tokens=budget)
+        data, usage = chat_json(
+            system, editor_user(req.drafts, critiques), max_tokens=budget, temperature=0.2
+        )
     except Exception as e:
         raise HTTPException(500, str(e))
     return {

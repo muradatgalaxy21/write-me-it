@@ -67,20 +67,36 @@ The critiques array MUST be same order and length as the items received."""
 
 # --- Editor: one prompt per phase ---
 
-EDITOR_OUTLINE_SYSTEM = """You are OUTLINE EDITOR. You receive 4-point outlines and the
-critic's issues. Apply every valid issue: sharpen the angle, swap weak sections for stronger
-ones, make bullets concrete. Keep it an OUTLINE - EXACTLY 4 points (TITLE + Intro + 2 main
-sections + Conclusion), plain "- " bullets, no prose paragraphs. Do NOT expand it into a blog.
+EDITOR_OUTLINE_SYSTEM = """You are OUTLINE EDITOR. You receive a 4-point outline and the
+critic's issues. Your job is to SHARPEN it in place, not shrink it.
+
+ABSOLUTE RULES:
+- Keep ALL 4 points (TITLE + Intro + 2 main sections + Conclusion) and EVERY bullet. The
+  output must have the SAME number of bullets as the input, or more - NEVER fewer.
+- Keep each bullet a concrete point. Rewrite ONLY the bullets the critic flagged as weak/vague;
+  copy the rest through verbatim.
+- DO NOT summarize, merge bullets, or drop detail. Plain "- " bullets, no prose paragraphs.
+  Do NOT expand it into a blog.
+Apply each valid issue: sharpen the angle, swap a weak section for a stronger one, make vague
+bullets concrete.
 Return STRICT JSON: {"edited": ["clean_outline1", "clean_outline2", ...]}
 Each array element is ONE plain-text string; use \\n for line breaks. NEVER a nested JSON
 object or array. Section headings live INSIDE the string, not as JSON keys. Example:
 {"edited": ["TITLE: ...\\n1. Introduction\\n- hook\\n2. Main section #1: ...\\n- point", "..."]}
 The edited array MUST be same order and length as the items received."""
 
-EDITOR_BLOG_SYSTEM = """You are BLOG EDITOR. You receive full blog posts and the critic's issues.
-Apply every valid issue: cut fluff, sharpen the intro, add specificity, fix passive voice.
-Return clean, publish-ready prose. No annotations. Keep it a FULL blog post - ~500-700 words,
-exactly 4 sections. DO NOT summarize, shorten, or collapse sections - polish in place.
+EDITOR_BLOG_SYSTEM = """You are BLOG EDITOR. You receive a RED-LINED draft: the original post
+with the critic's marks on top - ~~struck spans~~ to remove and {{notes}} marking spots to fix.
+
+Your job is MECHANICAL. Walk the red-lined draft from top to bottom and transcribe it:
+- Copy every unmarked word THROUGH UNCHANGED, character for character.
+- Where a span is ~~struck~~, delete just that span and leave the surrounding sentence intact.
+- Where there is a {{note}}, rewrite only the few words it points at to address the note.
+- Strip ALL marks from your output: no ~~tildes~~, no {{notes}}. Clean publish-ready prose.
+
+You are a transcriber, not an author. The output is the SAME post with marks resolved - same
+sections, same paragraphs, same length (~500-700 words). The only text that changes is what the
+critic marked; everything else is a verbatim copy.
 Return STRICT JSON: {"edited": ["clean1", "clean2", ...]}
 Each array element is ONE plain-text markdown string; use \\n for line breaks. NEVER a nested
 JSON object or array. Headings live INSIDE the string as "## ", not as JSON keys.
@@ -103,7 +119,13 @@ def critic_user(drafts: list[str]) -> str:
 def editor_user(drafts: list[str], critiques: list[dict]) -> str:
     parts = []
     for i, d in enumerate(drafts):
-        issues = critiques[i].get("issues", []) if i < len(critiques) else []
+        c = critiques[i] if i < len(critiques) else {}
+        annotated = c.get("annotated") or d  # fall back to raw draft if no red-lines
+        issues = c.get("issues", [])
         issues_txt = "\n- ".join(issues) if issues else "(none)"
-        parts.append(f"### Item {i + 1}\nORIGINAL:\n{d}\n\nCRITIC ISSUES:\n- {issues_txt}")
+        parts.append(
+            f"### Item {i + 1}\n"
+            f"RED-LINED DRAFT (transcribe it; apply the marks in place):\n{annotated}\n\n"
+            f"HEADLINE ISSUES (context only):\n- {issues_txt}"
+        )
     return "\n\n".join(parts)
