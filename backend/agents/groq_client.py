@@ -20,7 +20,7 @@ from groq import BadRequestError
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 # Default output cap. Each agent passes its own per-call budget so one stage
 # (e.g. the first writer) can't swallow the whole token allowance.
-DEFAULT_MAX_TOKENS = int(os.environ.get("GROQ_MAX_TOKENS", "2048"))
+DEFAULT_MAX_TOKENS = int(os.environ.get("GROQ_MAX_TOKENS", "10000"))
 
 # --- Gemini config ---------------------------------------------------------
 # Primary first, then lite. Override via env if needed.

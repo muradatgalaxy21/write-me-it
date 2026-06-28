@@ -1,4 +1,6 @@
 venv/
+write-me-it/
 __pycache__/
 *.pyc
 .env
+node_modules/

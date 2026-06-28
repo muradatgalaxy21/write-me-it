@@ -16,6 +16,7 @@ yarn-error.log*
 
 # Python
 **/venv/
+backend/write-me-it/
 **/__pycache__/
 **/*.pyc
 **/*.pyo
